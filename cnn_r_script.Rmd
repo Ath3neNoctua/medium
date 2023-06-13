@@ -1,0 +1,774 @@
+---
+title: "cnn script"
+author: "Jesper"
+date: "2023-06-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+rm(list = ls())
+```
+
+
+```{r, eval=FALSE}
+# assuming tensorflow and keras installed since often requires
+#install.packages("caret", "tidymodels")
+#devtools::install_github("andrie/deepviz")
+```
+
+
+# Libraries
+```{r, a,  message=FALSE}
+# Libraries
+# Mon Jun  5 11:21:13 2023 ------------------------------
+#library(reticulate)
+library(tensorflow, quietly = T) # nnet
+library(keras, quietly = T) # nnet
+
+# Fri Jun  9 11:10:00 2023 ------------------------------
+library(tidymodels, quietly = T) # supplementary functions
+library(caret, quietly = T) # confusionmatrix
+library(deepviz, quietly = T) # Viz nnet structure.
+```
+
+# Introduction
+CIFAR-10 is a multi-class dataset consisting of 60,000 32×32 colour images in 10 classes, with 6,000 images per class. The dataset comes partitioned into 50,000 32x32 color training images, pre-labeled over the 10 categories, and 10,000 test images. More specifically, "the x data is an array of RGB image data with shape(num_samples, 3, 32, 32). The y data is an array of category labels (integers in range 0-9) with shape (num_samples)". Meaning, the data is pre-split, into train-/test splits, for us and the classes are mutually exclusive with no overlap between them. Additionally, CIFAR-10 presents a moderately challenging problem as 32×32 images has a low signal-to-noise ratio making it hard for classifiers to draw clear decision boundaries. An example of this can be found here: http://karpathy.github.io/2011/04/27/manually-classifying-cifar10/. The images differ in scaling, rotation, positioning and background making it hard even for humans, see 'human accuracy' link above.  
+
+## Data
+```{r, b}
+# Tue Jun  6 13:58:38 2023 ------------------------------
+# Load data
+cifar <- dataset_cifar10()
+
+# Quick survey
+summary(cifar)
+str(cifar) # seems in order.
+
+# train data
+x_train <- scale(cifar$train$x) 
+# should be scaled using either /255 scaling or base R.
+# head(train_data) # Above yields column-vector, need to control dimensions. 
+
+# define dimension if using base R scaling.
+dim(x_train) <- c(50000 ,32, 32, 3) 
+#head(train_data) # looks alright!
+
+# repeat for response.
+y_train <- as.numeric(cifar$train$y)
+dim(y_train) <- c(50000)
+
+# control against 
+table(y_train)
+
+# three-peat for test data.
+x_test <- scale(cifar$test$x)
+dim(x_test) <- c(10000, 32, 32, 3) # note n = 10000 fo test data, from data desc.
+y_test <- as.numeric(cifar$test$y)
+dim(y_test) <- c(10000)
+```
+
+
+Everything seems in order. Note that the set dimensions are in effect and that we have perfectly balanced classes at 5000 per class for the labeled training data.
+To verify the dataset, we plot the first 30 images, from the training set, and display the class name above each image.
+
+
+```{r, c}
+# Tue Jun  6 13:58:48 2023 ------------------------------
+class_names <- c('airplane', 'automobile', 'bird', 'cat', 'deer',
+                 'dog', 'frog', 'horse', 'ship', 'truck') # assign class labels for plotting.
+index <- 1:30 # grab n = 30.
+par(mfcol = c(5,6), mar = rep(1, 4), oma = rep(0.2, 4)) # set plotting engine.
+cifar$train$x[index,,,] %>% #
+    purrr::array_tree(1) %>% #
+    purrr::set_names(class_names[cifar$train$y[index] + 1]) %>% #
+    purrr::map(as.raster, max = 255) %>% #
+    purrr::iwalk(~{plot(.x); title(.y)}) #
+```
+
+The labels seem to be in order and the required libraries, thus far, seem to behave expectedly. 
+
+## How to convolutional neural network, in short.
+
+### Input
+A CNN starts by taking an input, perhaps, an image. This image is represented as a 3D array of numbers where each number represents the pixel intensity, brightness, at a given point in the image. That is 2D. The 3D nature of the array is due to the RGB(Red, Green, Blue - mix them and get every color conceivable by human persons) color channels each image possesses.
+
+### Convolutional Layer
+This step, is crucial, generates the data that will be passed through the activation functions. A series of filters, kernels, are convolved over the input data to produce a set of feature maps. As each filter moves over the input image, it multiplies its weights with the underlying input values and sums them up to produce a single output value in the feature map.
+
+For example,
+
+![Kernel example](cnn_example.png "Cnn example")
+
+Borrowed from: https://www.youtube.com/watch?v=k3wsg0L28v8. 
+
+In this example we can see how a 2x2 kernel works in theory on a matrix consisted of arbitrarily selected integers. The application is called "mean blur" since this operation will yield a blurred feature map from the input matrix. Procedure as follows, we select a 2x2 surface, limegreen, from the input matrix, under 'Input'. The kernel does nothing in this example but in practice the kernel will consist of different numbers augmenting the input. The processing consists of taking the average value(mean blur). This is then repeated over each surface of the input. 
+The output feature mapping is displayed in the top right, notice how we now have fewer pixels. This is important to track if we are trying to branch our network in which different branches must be concatenated before flattening. More on this, perhaps, later. Additionally, note that this represents 1 filter. In general more than one filter is used.
+
+### Activation Function
+After convolution, the resulting feature maps are passed through an activation function transforming them to add non-linearity (to the learning process). Without this non-linearity, the neural network would be just a heap of simple linear regression models. One may think of a neural network as heaps of localized regression equations applied over a datarange and easily understand why they need so much data. The activation function is applied element-wise, independently on each value in the feature maps. 
+Common activation functions include the Rectified Linear Unit(ReLU), which replaces all negative pixel values in the feature map with zero, f(x) = max(0, x), like so. Or, in other words, for each input, x, if x is less than zero, it outputs zero and if x is greater than zero, it outputs x. I will be using leaky ReLU under 'improvements' which is a variant of the ReLU function that attempts to solve the "dying ReLU" problem where neurons get stuck in the state where they output zero and don't recover. Leaky ReLU works similarly to the original ReLU function but adds "leak", like so f(x) = max(0.01x, x), to keep the function active when it would otherwise output zero. In other words, for each input x it sees, if x is less than zero, it outputs 0.01x (i.e., a small fraction of x), and if x is greater than zero, it outputs x.
+
+### Pooling
+This is common but not required. After the activation function the output might be passed through a pooling layer educing the dimensionality of the data while retaining the most important information. For example, max pooling takes a small window, say 2x2 pixels, and only keeps the maximum value in that window. As we shall soon see, when we apply kernels the input grows quite rapidly and pooling is preferred. Imagine using 64 filters, this would yield 64 feature mappings per input image(yeah... pooling)
+
+### Regularization
+This is also common but not required. As we have seen, in a previous assignment, statistical learning algorithms will happily overfit, especially on low signal-to-noise data. We notice this through a discrepancy between training metrics and validation metrics. Regularization methods add a penalty to the loss function, depends on the problem at hand classic examples; mean squared error for regression or cross-entropy for classification, effectively constraining the model and encouraging it to have smaller weights, which leads to simpler models.
+To mitigate this we may use data augmentation or any type of regularization- or even normalization method, for example batch normalization. 
+
+
+### Fully Connected, or Dense, layer
+Finally, the output of the pooling layer, or the convolution and activation layers with no pooling, is flattened into a row vector and passed into the fully connected layers. These layers learn global patterns in the input data. For multi-class classification problems the last fully connected layer uses a softmax activation function which converts into a vector of categorical probabilities which sum to 1. This is the final output - a class prediction!
+
+### Last note
+Per usual a good approach often involves starting with a simpler network and gradually increasing complexity as needed, while monitoring performance on a separate validation set to ensure the model is learning and not just learning to reproduce the training data. Note, responsibility is advised, tweaking a model to perform better on the in-sample test data, is in fact manually fitting a model to the in-sample test data. This may be referred to as manual overfitting, with the risk of poor out-of-sample performance as a consequence 
+
+
+# Define the structure of your neural network model;
+
+Let's start with defining a very simple network just to establish a mental framework with respect to the short walktrough above.
+
+```{r, d}
+mdl0 <- keras_model_sequential() %>%
+    layer_conv_2d(filters = 16, kernel_size = c(3,3), 
+# Consequence: smaller kernel extract feature from smaller area of pic but more prone to overfit.
+# Apply scientific method here(aka. think + mess around and find out(what it does) + repeat).
+# Filter means every single processing has 16 different kernels, each 3 by 3 per above.
+# each of these filters are performing a different task, for instance one may blur the picture, the next contrast, the next trying to detect darkness, e.tc. 
+# I.e we have 16 filters applied to 1 image outputting 16 objects, feature mappings, per picture from this layer alone.
+    
+    activation = "relu", # replaces all negative pixel values in the feature map with zero, 
+                         # f(x) = max(0, x), like so.
+input_shape = c(32, 32, 3)) %>% # define input shape as expected. 
+
+layer_max_pooling_2d(pool_size = c(2,2))  # use max pooling.
+```
+
+Let us peek at the structure of the convolutional part of the network.
+
+```{r, e}
+summary(mdl0)
+```
+
+```{r, f, warning=FALSE}
+# display the architecture of your model;
+plot_model(mdl0)
+```
+
+When calling keras it establishes a input layer which is practically a placeholder for the defined structure. We have 1 convolutional layer with 16 filters, using 3x3 kernels and the ordinary ReLU activation function and 1 max pooling layer. 
+
+# Add Dense layers such as flatten and output layer;
+
+Let us now define a dense structure for this network.
+
+```{r, g}
+mdl0 %>%
+    # Flatten convolutional output and feed into dense layer
+    layer_flatten() %>% # means we turn an array into a line, imagine taking the 1st row then the 2nd and so on and laying it down like railroad tracks. Essentially going from a 2d matrix to a row vector. So that we can easily pass our input into the conventional part of this net.
+    layer_dense(units = 64, activation = "relu") %>%
+
+    layer_dense(units = 32, activation = "relu") %>% 
+  
+  # Outputs from dense layer are projected onto 10 unit output 
+  # layer using softmax activation function.
+    layer_dense(units = 10, activation = "softmax")
+
+```
+
+This will practically narrow down the input from the convolutional part into a class prediction. Let us review the full structure.
+
+```{r,h}
+summary(mdl0)
+```
+```{r, i,  warnings = FALSE}
+plot_model(mdl0)
+```
+
+Reviewing the full structure, note that we have added a flatten layer and 3 dense layers out of which 1 is the output layer using the softmax activation, the two above layers are using the ReLU activation aswell as narrowing down the classes into a class prediction. The narrowing down can be seen considering that the first dense layer has 64 nodes, the next has 32 and the last obviously has 10 since we are predicting 1 out of 10 classes here. 
+
+# Compile and train the model
+
+Before training our model we must compile it, which practically means define some additional required settings for the model. We need to select an optimizer which determines how the model will be updated based on the computed gradients during training. One common alternative is "Adam" or "Adaptive Moment Estimation". It combines the ideas of momentum and adaptive learning rates to update the models parameters during training. Explaining how it works in vivid detail is outside the scope of this report but I will supply an explanation on request.
+Additionally, we need to select a loss function which quantifies how well the model is performing by measuring the deviation between predicted output and true output, a classic loss function is MSE or mean squared error. For multi-class classification problems sparse categorical crossentropy seems to be preferred. It measures the difference between the predicted probabilities and the true labels encoded as integers penalizing larger discrepancies. This will in turn guide the model to improve its predictions.
+Lastly, we need to define our evaluation metrics which is derived from the use case of the model. In general one may follow this framework to land on a suitable metric. 1. Ponder what is more expensive, a false positive or a false negative? 2. Use the least worst alternative. 
+
+```{r, j}
+# compile 
+mdl0 %>% 
+    compile(optimizer = "adam", # using adaptive moment estimation.
+    loss = "sparse_categorical_crossentropy", # for mulit-class data.
+    metrics = c("accuracy")) # evaluation metrics
+```
+
+
+# train the model;
+
+Now, we are ready to train the model, depending on complexity and the structure of the network this may take some time. We are handling a very small network, just to build a mental framework moving forward, but some outrageous training times can easily be achieved or found on Kaggle some ranging above 24h. Some final formalia, we need to pass the training data as well as the labeled training data for eval. We need to define the number of epochs which determines how many times the entire data will pass trough the model during training. This allows the model to learn from the data and update its parameters increasing performance.
+
+
+```{r, k}
+# training a conv nnet the random initialization of weights, shuffling of the training data, 
+# and other things involving randomness can affect the training process. Thus, set seed. #epochs: 8
+set.seed(5) 
+history0 <- mdl0 %>%
+    fit(x = x_train, 
+        y = y_train,
+        epochs = 8, # determines how many times the entire data will pass trough the model 
+                    # during training. This allows the model to learn from the data and update its                      # increasing performance.
+        validation_split = 0.2, # using 5 fold cv for training.
+        use_multiprocessing = TRUE) # smoke'em if you have'em.
+
+```
+
+
+
+```{r, l, warning=FALSE}
+# plot training history.
+p0 <- plot(history0) + geom_line() + theme_bw() + labs(title = "Simple network performance")
+p0
+```
+
+We can already see from the training plot that this simple network is poor at capturing the underlying patterns in the data. For a more detailed evaluation we can use confusionmatrix from Caret. 
+
+```{r, m, message = FALSE}
+# Thu Jun  8 10:38:41 2023 ------------------------------
+pred0 <- predict(mdl0, x_train) %>%
+    k_argmax() %>%
+    as.vector() # for some ungodly reason they depreciated predict_classes with no replacement...
+
+# 
+c("0" = 'airplane', "1" = 'automobile', "2" = 'bird', "3" = 'cat', "4" = 'deer',
+                 "5" = 'dog', "6" = 'frog', "7" = 'horse',"8" = 'ship', "9" = 'truck')
+
+# print evaluation metrics
+confusionMatrix(table(pred0, y_train))
+
+```
+
+
+The training accuracy is around 0.73 but we have already seen that validation accuracy is lower at around 0.65. This is better than random guess which would represent an accuracy of 0.1. I will not run this model against test data since I see no point. I know we can do better and, in my opinion, the test data is reserved for the model that has earned it. Meaning, in a general case I would run the above net against test data and evaluate the actual performance. Basically the last step with different data. But this time around I will try to find a better model first.
+
+
+# Improvements:
+
+As far as improvements are concerned there are tonnes of possible routes. This report is already looking to become lengthy so I will limit myself to 2 simple ways of improving performance and one(maybe 2!) less simple ways.
+
+## Improvement 1: Data augmentation
+
+Just to recapitulate, the above network had some trouble detecting the underlying patterns in the data and perhaps trouble generalizing since there was some discrepancy between the training and validation accuracy. One way to improve generalize-ability is to augment the data in some way. Either by flipping the input pictures in a random way(mirroring) and-/or rotating them. Luckily, Keras already have some built in functions to accomplish this. Let us see if this can improve performance.   
+
+```{r, n}
+# DATA AUGMENTATION. ZCA WHITENING AND GCA SCALING SEEMS POPULAR ON KAGGLE. 
+# Should perhaps try it...
+
+# Initialize sequential model
+mdl1 <- keras_model_sequential()
+
+# If it's random, seed it.  
+set.seed(2)
+data_augmentation <- keras_model_sequential() %>%
+        layer_random_flip("horizontal") %>%
+        layer_random_rotation(0.04)
+
+mdl1 <- mdl1 %>%
+        data_augmentation()
+```
+
+
+Let us try this for our bad model above and see if this short data augmentation can improve the model performance. 
+
+This is the exact same model used before. 
+```{r, o}
+mdl1 <- keras_model_sequential() %>%
+    layer_conv_2d(filters = 16, kernel_size = c(3,3), 
+# Consequence: smaller kernel extract feature from smaller area of pic but more prone to overfit.
+# Apply scientific method here(aka. think + mess around and find out(what it does) + repeat).
+# Filter means every single processing has 16 different kernels, each 3 by 3 per above.
+# each of these filters are performing a different task, for instance one may blur the picture, the next contrast, the next trying to detect darkness, e.tc. 
+# I.e we have 16 filters applied to 1 image outputting 16 objects, feature mappings, per picture from this layer alone.
+    
+    activation = "relu", # replaces all negative pixel values in the feature map with zero, 
+                         # f(x) = max(0, x), like so.
+input_shape = c(32, 32, 3)) %>% # define input shape as expected. 
+
+layer_max_pooling_2d(pool_size = c(2,2))  # use max pooling.
+
+mdl1 %>%
+    # Flatten convolutional output and feed into dense layer
+    layer_flatten() %>% # means we turn an array into a line, imagine taking the 1st row then the 2nd and so on and laying it down like railroad tracks. Essentially going from a 2d matrix to a row vector. So that we can easily pass our input into the conventional part of this net.
+    layer_dense(units = 64, activation = "relu") %>%
+
+    layer_dense(units = 32, activation = "relu") %>% 
+  
+  # Outputs from dense layer are projected onto 10 unit output 
+  # layer using softmax activation function.
+    layer_dense(units = 10, activation = "softmax")
+```
+
+
+Just to confirm that this is the same model as before crammed into one chunk.
+
+```{r, p}
+summary(mdl1)
+```
+
+```{r, q}
+plot_model(mdl1)
+```
+
+Yep.
+
+Using same optimizer, loss and metrics.
+
+```{r, r}
+# compile 
+mdl1 %>% 
+    compile(optimizer = "adam", # using adaptive moment estimation.
+    loss = "sparse_categorical_crossentropy", # for mulit-class data.
+    metrics = c("accuracy")) # evaluation metrics
+
+```
+
+
+```{r, s}
+# training a conv nnet the random initialization of weights, shuffling of the training data, 
+# and other things involving randomness can affect the training process. Thus, set seed. # epochs: 8
+set.seed(5) 
+history1 <- mdl1 %>%
+    fit(x = x_train, 
+        y = y_train,
+        epochs = 8, # determines how many times the entire data will pass trough the model 
+                    # during training. This allows the model to learn from the data and update its                      # increasing performance.
+        validation_split = 0.2, # using 5 fold cv for training.
+        use_multiprocessing = TRUE) # smoke'em if you have'em.
+
+```
+
+```{r, t, warning=FALSE}
+# plot training history.
+p1 <- plot(history1) + geom_line() + theme_bw() + labs(title = "Simple network performance", subtitle = "w/ data augmentation")
+p1
+```
+
+
+```{r, u, message = FALSE}
+# Thu Jun  8 10:38:41 2023 ------------------------------
+pred1 <- predict(mdl1, x_train) %>%
+    k_argmax() %>%
+    as.vector() # for some ungodly reason they depreciated predict_classes with no replacement...
+
+# 
+c("0" = 'airplane', "1" = 'automobile', "2" = 'bird', "3" = 'cat', "4" = 'deer',
+                 "5" = 'dog', "6" = 'frog', "7" = 'horse',"8" = 'ship', "9" = 'truck')
+
+# print evaluation metrics
+confusionMatrix(table(pred1, y_train))
+
+```
+
+The data augmentation alone yields no significant increment in training accuracy. Additionally, we failed to mitigate the discrepancy between accuracy and validation accuracy. Our network is obviously not sensitive enough. Which is an excellent segway into...
+
+ b ## Improvement 2: More layers and regularization.
+
+Next improvement will be multiple improvements, this report will be a book if I am to make one improvement at a time. Let us try to add more convolutional layers, with more filters, and dense layers. This will of course make it easier to detect the underlying patterns at risk of overfitting. Thus, I will also add regularization using dropout, meaning randomly selecting a subset of neurons during each training iteration and de-activate them. Which may improve the networks ability to generalize to the unseen data. 
+
+This is the same data augmentation used before.
+
+```{r, v}
+# DATA AUGMENTATION. ZCA WHITENING AND GCA SCALING SEEMS POPULAR ON KAGGLE. 
+# Should perhaps try it...
+
+# Initialize sequential model
+mdl2 <- keras_model_sequential()
+
+# If it's random, seed it.  
+set.seed(2)
+data_augmentation <- keras_model_sequential() %>%
+        layer_random_flip("horizontal") %>%
+        layer_random_rotation(0.04)
+
+mdl2 <- mdl2 %>%
+        data_augmentation()
+```
+
+This is the same mental framework as earlier, just with more layers, note more filters and some dropout.
+
+```{r, x}
+mdl2 <- keras_model_sequential() %>%
+    layer_conv_2d(filters = 32, kernel_size = c(3,3), 
+# Consequence: smaller kernel extract feature from smaller area of pic but more prone to overfit.
+# Apply scientific method here(aka. think + mess around and find out(what it does) + repeat).
+# Filter means every single processing has 16 different kernels, each 3 by 3 per above.
+# each of these filters are performing a different task, for instance one may blur the picture, the next contrast, the next trying to detect darkness, e.tc. 
+# I.e we have 16 filters applied to 1 image outputting 16 objects, feature mappings, per picture from this layer alone.
+    
+   activation = "relu", # replaces all negative pixel values in the feature map with zero, 
+                         # f(x) = max(0, x), like so.
+   input_shape = c(32, 32, 3)) %>% # define input shape as expected. 
+
+   layer_max_pooling_2d(pool_size = c(2,2)) %>%   # use max pooling. 
+  
+   layer_conv_2d(filters = 64, kernel_size = c(3,3), 
+              activation = "relu") %>%
+   layer_max_pooling_2d(pool_size = c(2,2)) %>%
+  
+   layer_conv_2d(filter = 64, kernel_size = c(3,3), 
+                 activation = "relu") %>%
+   layer_max_pooling_2d(pool_size = c(2,2)) %>%
+   layer_dropout(0.25)
+
+```
+
+```{r, y}
+summary(mdl2)
+```
+```{r, z}
+plot_model(mdl2)
+```
+
+
+Compare this convolutional part of the network to the simplest one, it's obvious that this is more substantial. Now let us add more dense layers with more neurons and use the same trickle-down approach as earlier, meaning narrowing down to a class prediction.
+
+
+```{r, aa}
+mdl2 %>%
+  
+  layer_dense(units = 256, activation = "relu") %>%
+    # 256 neurons as input, will slowly reduce our features created 
+    # in the above step to the thingsthat we want
+    layer_dense(units = 128, activation = "relu") %>%
+    # Flatten convolutional output and feed into dense layer
+    layer_flatten() %>% # means we turn an array into a line, imagine taking the 1st row then the 2nd                          # and so on and laying it down like railroad tracks. Essentially going from a                          # 2d matrix to a row vector. So that we can easily pass our input into the                             # conventional part of this net.
+    layer_dense(units = 64, activation = "relu") %>%
+    layer_dense(units = 32, activation = "relu") %>% 
+  # Outputs from dense layer are projected onto 10 unit output 
+  # layer using softmax activation function.
+    layer_dense(units = 10, activation = "softmax")
+```
+
+
+```{r, bb}
+summary(mdl2)
+```
+
+```{r, cc}
+plot_model(mdl2)
+```
+
+
+Using same optimizer, loss and metrics.
+
+```{r, dd}
+# compile 
+mdl2 %>% 
+    compile(optimizer = "adam", # using adaptive moment estimation.
+    loss = "sparse_categorical_crossentropy", # for mulit-class data.
+    metrics = c("accuracy")) # evaluation metrics
+
+```
+
+
+```{r, ee}
+# training a conv nnet the random initialization of weights, shuffling of the training data, 
+# and other things involving randomness can affect the training process. Thus, set seed. # epochs: 6
+set.seed(5) 
+history2 <- mdl2 %>%
+    fit(x = x_train, 
+        y = y_train,
+        epochs = 6, # determines how many times the entire data will pass trough the model 
+                    # during training. This allows the model to learn from the data and update its                      # increasing performance.
+        validation_split = 0.2, # using 5 fold cv for training.
+        use_multiprocessing = TRUE) # smoke'em if you have'em.
+
+```
+
+
+
+
+```{r, ff, warning=FALSE}
+# plot training history.
+p2 <- plot(history2) + geom_line() + theme_bw()
+p2
+```
+
+What is apparent is with this improvement is that we achieve convergence of training and validation matrics meaning we managed to reduce overfitting, as well as an incremental improvement in performance. 
+
+
+```{r, gg}
+# Thu Jun  8 10:38:41 2023 ------------------------------
+pred2 <- predict(mdl2, x_train) %>%
+    k_argmax() %>%
+    as.vector() # for some ungodly reason they depreciated predict_classes with no replacement...
+
+# 
+c("0" = 'airplane', "1" = 'automobile', "2" = 'bird', "3" = 'cat', "4" = 'deer',
+                 "5" = 'dog', "6" = 'frog', "7" = 'horse',"8" = 'ship', "9" = 'truck')
+
+# print evaluation metrics
+confusionMatrix(table(pred2, y_train))
+
+```
+
+More layers yield a small but significant increment in training accuracy. Now we are performing about the same as many basic tutorials on this dataset. 
+
+### Batch normalization.
+
+We saw that more layers improved the performance, in true Open-ai spirit the next improvement will involve many more layers and batch normalization. Batch normalization aims to address the problem of internal covariate shift, meaning change in the distribution of network activations as the model learns. The basic idea is to calculate the mean and standard deviation of the input values within a batch and then normalize the values based on these statistics. This is then applied to the inputs of each layer, adjusting them to have zero mean and unit variance. 
+
+```{r, hh}
+# Initialize sequential model
+mdl3 <- keras_model_sequential()
+
+# If it's random, seed it.  
+set.seed(2)
+data_augmentation <- keras_model_sequential() %>%
+        layer_random_flip("horizontal") %>%
+        layer_random_rotation(0.04)
+
+mdl3 <- mdl3 %>%
+        data_augmentation()
+
+mdl3 <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32, kernel_size = c(3,3), padding = "same", 
+                input_shape = c(32,32,3)) %>%
+  layer_batch_normalization() %>%
+  layer_activation('relu') %>%
+  layer_conv_2d(filters = 64, kernel_size = c(3,3), padding = "same") %>%
+  layer_batch_normalization() %>%
+  layer_activation('relu') %>%
+  layer_max_pooling_2d(pool_size = c(2,2)) %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3,3), padding = "same") %>%
+  layer_batch_normalization() %>%
+  layer_activation('relu') %>%
+  layer_conv_2d(filters = 128, kernel_size = c(3,3), padding = "same") %>%
+  layer_batch_normalization() %>%
+  layer_activation('relu') %>%
+  layer_max_pooling_2d(pool_size = c(2,2)) %>%
+  layer_conv_2d(filters = 256, kernel_size = c(3,3), padding = "same") %>%
+  layer_batch_normalization() %>%
+  layer_activation('relu') %>%
+  layer_conv_2d(filters = 256, kernel_size = c(3,3), padding = "same") %>%
+  layer_batch_normalization() %>%
+  layer_activation('relu') %>%
+  layer_max_pooling_2d(pool_size = c(2,2)) %>%
+  #CONV ABV  
+# Mon Jun 12 12:56:47 2023 ------------------------------
+  # DENSE BLW
+  layer_flatten() %>%
+  layer_dropout(0.2) %>%
+  layer_dense(units = 1024) %>%
+  layer_batch_normalization() %>%
+  layer_activation('relu') %>%
+  layer_dense(units = 512) %>%
+  layer_batch_normalization() %>%
+  layer_activation('relu') %>%
+  layer_dense(units = 256) %>% 
+  layer_dense(units = 128) %>% 
+  layer_dense(units = 10, activation = 'softmax')
+```
+
+```{r, ii}
+summary(mdl3)
+```
+
+```{r, jj}
+# compile 
+mdl3 %>% 
+    compile(optimizer = "adam", # using adaptive moment estimation.
+    loss = "sparse_categorical_crossentropy", # for mulit-class data.
+    metrics = c("accuracy")) # evaluation metrics
+
+```
+
+
+```{r, kk}
+# NOTE THIS TRAINING PROCEDURE WILL TAKE MORE THAN 1 HOUR WITHOUT CUDA. 
+# training a conv nnet the random initialization of weights, shuffling of the training data, 
+# and other things involving randomness can affect the training process. Thus, set seed. 
+# epochs: 8
+set.seed(5) 
+history3 <- mdl3 %>%
+    fit(x = x_train, 
+        y = y_train,
+        epochs = 8, # determines how many times the entire data will pass trough the model 
+                    # during training. This allows the model to learn from the data and update its                      # increasing performance.
+        validation_split = 0.2, # using 5 fold cv for training.
+        use_multiprocessing = TRUE) # smoke'em if you have'em.
+```
+
+
+
+```{r, ll, warning=FALSE}
+# plot training history.
+p3 <- plot(history3) + geom_line() + theme_bw() + labs(title = "Big model", subtitle = "w/ batch normalization.")
+
+p3
+```
+
+
+
+```{r, mm}
+# Thu Jun  8 10:38:41 2023 ------------------------------
+pred3 <- predict(mdl3, x_train) %>%
+    k_argmax() %>%
+    as.vector() # for some ungodly reason they depreciated predict_classes with no replacement...
+
+# 
+c("0" = 'airplane', "1" = 'automobile', "2" = 'bird', "3" = 'cat', "4" = 'deer',
+                 "5" = 'dog', "6" = 'frog', "7" = 'horse',"8" = 'ship', "9" = 'truck')
+
+# print evaluation metrics
+confusionMatrix(table(pred3, y_train))
+
+```
+
+This model is worthy of held out testing data. 
+
+```{r, nn}
+# Thu Jun  8 10:38:41 2023 ------------------------------
+pred3 <- predict(mdl3, x_test) %>%
+    k_argmax() %>%
+    as.vector() # for some ungodly reason they depreciated predict_classes with no replacement...
+
+# 
+c("0" = 'airplane', "1" = 'automobile', "2" = 'bird', "3" = 'cat', "4" = 'deer',
+                 "5" = 'dog', "6" = 'frog', "7" = 'horse',"8" = 'ship', "9" = 'truck')
+
+# print evaluation metrics
+confusionMatrix(table(pred3, y_test))
+
+```
+
+This is a substantial improvement from the earlier models without unnecessary addition of complexity. For this post this is the preferred model. But as always can still be improved upon by adding more layers, filters and regularization. As Open AI has shown, more is truly more...
+The final model is ok, luke warm, it is indeed possible to improve upon furhter but this would inject complexity and pro-longed training times. 
+To recap wrt to the assignment; this model is a cnn using batch normalization with many convolutional layers and pooling layers. Using adam optimizer and sparse categorical cross-entropy. I used accuracy as primary evaluation. The final model is deeper and has a more complex architecture compared to previous models and in turn performs better wrt accuracy. I will make a trade-off between training time and performance and go with this model, which took 1h+ to train.
+
+
+## Improvement 3: 
+
+As per usual an ensemble of weak "learners", in this case neural networks, can make one strong learner.
+I have already defined most of the steps I will use earlier. Additionally, I would suggest trying to build semi-strong learners and combine them. In the last assignment I pointed out that the more diverse an ensemble, the "more reasonable". Meaning, for example, a learner consisted of 3 boosted tree-models is unlikely to achieve any substantial boost in performance. Translated into this use-case one should try one approach per sub-model, meaning one sub-model heavy on normalization and another heavy on regularization, and a third heavy on data augmentation and so on. Compare this to an ensemble of 3 models where all of them contain normalization, regularization and augmentation. 
+I am afraid my time is on the short end and I will not build three "big" models as the last one seen for ensembling. I will provide this last improvement more as a proof-of-concept, or mental framework, to show that it is possible. And submit one way to ensemble predictions, using a so called hard vote.
+I will also speed this up, meaning much action in few chunks.
+
+```{r, oo}
+# Standard small cnn
+sub_mdl1 <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32, kernel_size = c(3,3), padding = "same", 
+                activation = "relu", input_shape = c(32, 32, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2,2)) %>%
+  layer_conv_2d(filters = 64, kernel_size = c(3,3), padding = "same", 
+                activation = "relu") %>%
+  layer_max_pooling_2d(pool_size = c(2,2)) %>%
+ 
+     layer_flatten() %>%
+  layer_dense(units = 512, activation = 'relu') %>%
+  layer_dense(units = 10, activation = 'softmax')
+
+# Mon Jun 12 13:29:09 2023 ------------------------------
+
+# cnn w/ dropout
+sub_mdl2 <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32, kernel_size = c(3,3), padding = "same", activation = "relu", 
+                input_shape = c(32, 32, 3)) %>%
+  layer_max_pooling_2d(pool_size = c(2,2)) %>%
+  layer_dropout(rate = 0.25) %>%
+  layer_conv_2d(filters = 64, kernel_size = c(3,3), padding = "same", activation = "relu") %>%
+  layer_max_pooling_2d(pool_size = c(2,2)) %>%
+  layer_dropout(rate = 0.25) %>%
+  layer_flatten() %>%
+  layer_dense(units = 512, activation = 'relu') %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 10, activation = 'softmax')
+
+# Mon Jun 12 13:29:15 2023 ------------------------------
+# cnn with batch normalization
+
+sub_mdl3 <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32, kernel_size = c(3,3), padding = "same", activation = "relu", 
+                input_shape = c(32, 32, 3)) %>%
+  layer_batch_normalization() %>%
+  layer_max_pooling_2d(pool_size = c(2,2)) %>%
+  layer_conv_2d(filters = 64, kernel_size = c(3,3), padding = "same", activation = "relu") %>%
+  layer_batch_normalization() %>%
+  layer_max_pooling_2d(pool_size = c(2,2)) %>%
+  layer_flatten() %>%
+  layer_dense(units = 512, activation = 'relu') %>%
+  layer_batch_normalization() %>%
+  layer_dense(units = 10, activation = 'softmax')
+```
+
+```{r, pp}
+
+# compile sub_model1
+sub_mdl1 %>% 
+    compile(optimizer = "adam",
+    loss = "sparse_categorical_crossentropy", # for mulit-class data.
+    metrics = c("accuracy"))
+
+# compile sub_model2
+sub_mdl2 %>% 
+    compile(optimizer = "adam",
+    loss = "sparse_categorical_crossentropy", # for mulit-class data.
+    metrics = c("accuracy"))
+
+# compile sub_model3
+sub_mdl3 %>% 
+    compile(optimizer = "adam",
+    loss = "sparse_categorical_crossentropy", # for mulit-class data.
+    metrics = c("accuracy"))
+```
+
+```{r, qq}
+# fit the models
+
+# epochs: 3
+
+# Thu Jun  8 12:23:52 2023 ------------------------------
+sub_history1 <- sub_mdl1 %>% fit(x = x_train, y = y_train, 
+                           epochs = 3, batch_size = 32, 
+                           validation_split = 0.2, 
+                           use_multiprocessing = TRUE)
+
+# Thu Jun  8 12:23:55 2023 ------------------------------
+sub_history2 <- sub_mdl2 %>% fit(x = x_train, y = y_train,  
+                           epochs = 3, batch_size = 32, 
+                           validation_split = 0.2, 
+                           use_multiprocessing = TRUE)
+
+# Thu Jun  8 12:23:59 2023 ------------------------------
+sub_history3 <- sub_mdl3 %>% fit(x = x_train, y = y_train,  
+                           epochs = 3, batch_size = 32, 
+                           validation_split = 0.2, 
+                           use_multiprocessing = TRUE)
+
+# Making predictions
+predictions1 <- predict(sub_mdl1, x_train) %>% k_argmax() %>% as.vector()
+#
+predictions2 <-  predict(sub_mdl2, x_train) %>% k_argmax() %>% as.vector()
+#
+predictions3 <-  predict(sub_mdl3, x_train) %>% k_argmax() %>% as.vector()
+
+
+# Thu Jun  8 16:59:18 2023 ------------------------------
+# individual eval
+#confusionMatrix(table(predictions1, y_train))
+#confusionMatrix(table(predictions2, y_train))
+#confusionMatrix(table(predictions3, y_train))
+
+
+# Thu Jun  8 16:59:21 2023 ------------------------------
+#ensemble
+
+# Hard Voting
+final_predictions_hard <- (predictions1 + predictions2 + predictions3) / 3
+final_predictions_hard <- round(final_predictions_hard)
+
+# eval using hard vote
+confusionMatrix(table(final_predictions_hard, y_train))
+```
+
+Additional ways to improve would be using different activation functions, or an ensemble of learners with different activation functions, experimenting with different learn rates of the optimizer. A trade-off has been made between training time and performance. I acknowledge that the preferred model is ok but can become good given that one accepts longer training times and added complexity. 
+I will end on this note and aalso extend my gratitude for a well put together course during which i learnt many new things, thank you!
